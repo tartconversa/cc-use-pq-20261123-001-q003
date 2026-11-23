@@ -10,6 +10,8 @@ from pydantic import ValidationError
 
 from fieldproof.analysis import evidence, reconcile
 from fieldproof.common import encoded, Problem, invalid
+from fieldproof.crossover import evidence as crossover_evidence
+from fieldproof.crossover.analysis import build as crossover_build
 from fieldproof.design.contracts import Key, Input
 from fieldproof.design.registry import get_trial, roster
 from fieldproof.signals import ledger
@@ -25,7 +27,12 @@ class IngestSelection(Input):
 def import_sheet(db, arguments):
     select = IngestSelection(trial_id=arguments.trial, delivery_id=arguments.delivery)
     trial = get_trial(db, select.trial_id)
-    assigned = roster(db, trial.trial_id)
+    if trial.plan.is_crossover:
+        from fieldproof.crossover.registry import crossover_roster
+
+        assigned = crossover_roster(db, trial)
+    else:
+        assigned = roster(db, trial.trial_id)
     handle = (
         nullcontext(sys.stdin)
         if arguments.sheet == "-"
@@ -41,11 +48,24 @@ def preview(db, arguments):
     window = evidence.select_window(trial, arguments.start, arguments.end)
     if arguments.cut is not None and not 0 <= arguments.cut < 2**63:
         raise invalid("cut_range", "Cut must be a nonnegative 64-bit integer")
+    if trial.plan.is_crossover:
+        document = crossover_build(
+            db, trial, window, arguments.cut, arguments.schedule_seq
+        )
+        return (
+            crossover_evidence.csv_metrics(document)
+            if arguments.csv
+            else encoded(document)
+        )
     document = evidence.build(db, trial, window, arguments.cut)
     return reconcile.csv_metrics(document) if arguments.csv else encoded(document)
 
 
 def export(db, arguments):
+    trial = get_trial(db, arguments.trial)
+    if trial.plan.is_crossover:
+        document = crossover_evidence.get(db, arguments.trial, arguments.evidence)
+        return crossover_evidence.csv_metrics(document)
     document = evidence.get(db, arguments.trial, arguments.evidence)
     return reconcile.csv_metrics(document)
 
@@ -70,6 +90,10 @@ def make_parser():
     draft.add_argument("--start", type=iso_date)
     draft.add_argument("--end", type=iso_date)
     draft.add_argument("--cut", type=int)
+    draft.add_argument(
+        "--schedule-seq", type=int, default=None,
+        help="Crossover schedule ledger position (crossover trials only)",
+    )
     draft.add_argument("--csv", action="store_true")
     frozen = commands.add_parser("export", help="Export the numbers in frozen evidence")
     frozen.add_argument("trial")

@@ -154,3 +154,157 @@ class ApiCase(unittest.TestCase):
             "evidence_id": evidence_id, "expected_edition": edition,
             "outcome": outcome, "note": note,
         }, status=status)
+
+
+CROSS_ROOT = "/trials/frost"
+CROSS_MAIN = CROSS_ROOT + "/markets/alpine"
+
+
+def crossover_plan(*, required_per_sequence=2, divergence_bp=5_000, divergence_wh=100,
+                   washout_days=2, required_cycles=1):
+    return {
+        "title": "Cold site crossover",
+        "program": "laundry",
+        "starts_on": "2026-10-24",
+        "ends_before": "2026-11-30",
+        "markets": [{
+            "market_id": "alpine", "label": "Alpine",
+            "cells": [{"climate": "cold", "load": "light", "weight_bp": 10_000}],
+        }],
+        "policy": {
+            "required_units_per_arm": 2,
+            "required_cycles_per_unit": 1,
+            "minimum_unit_coverage_bp": 8_000,
+            "max_alarm_increase_bp": 0,
+            "max_failure_increase_bp": 0,
+            "min_manual_saving_bp": 1_000,
+            "max_energy_increase_bp": 5_000,
+            "max_missing_energy_bp": 0,
+            "max_cycle_seconds": 7_200,
+            "max_cycle_wh": 2_000,
+        },
+        "crossover": {
+            "policy": {
+                "required_units_per_sequence": required_per_sequence,
+                "required_cycles_per_period": required_cycles,
+                "minimum_washout_days": washout_days,
+                "max_sequence_divergence_bp": divergence_bp,
+                "max_energy_divergence_wh": divergence_wh,
+                "max_missing_energy_bp": 0,
+            }
+        },
+    }
+
+
+# 固定本地日程：第一期 10-24..10-29，洗脱 10-29..10-31，第二期 10-31..11-05。
+def crossover_unit(unit_id, sequence, *, site_id="north", load="light",
+                   first_from="2026-10-24", first_until="2026-10-29",
+                   second_from="2026-10-31", second_until="2026-11-05"):
+    return {
+        "unit_id": unit_id, "site_id": site_id, "sequence": sequence, "load": load,
+        "first_from": first_from, "first_until": first_until,
+        "second_from": second_from, "second_until": second_until,
+    }
+
+
+def cross_event(unit, cycle, label, kind, at, **fields):
+    return {
+        "event_id": f"{unit}-{cycle}-{label}", "revision": 1,
+        "unit_id": unit, "cycle_id": cycle, "kind": kind,
+        "occurred_at": at, **fields,
+    }
+
+
+def cross_observations(unit, cycle, start, *, manual=False, wh=100, seconds=600,
+                       alarm=False, abort=False):
+    moment = datetime.fromisoformat(start)
+    middle = (moment + timedelta(seconds=seconds // 2)).isoformat()
+    close = (moment + timedelta(seconds=seconds)).isoformat()
+    rows = [cross_event(unit, cycle, "start", "start", start)]
+    if manual:
+        rows.append(cross_event(unit, cycle, "manual", "manual", middle))
+    if alarm:
+        rows.append(cross_event(unit, cycle, "alarm", "alarm", middle, reason="overheat"))
+    if wh is not None:
+        rows += [
+            cross_event(unit, cycle, "m0", "meter", start, meter_id="main", meter_wh=20),
+            cross_event(unit, cycle, "m1", "meter", close, meter_id="main", meter_wh=20 + wh),
+        ]
+    if abort:
+        rows.append(cross_event(unit, cycle, "end", "abort", close, reason="jam"))
+    else:
+        rows.append(cross_event(unit, cycle, "end", "complete", close))
+    return rows
+
+
+class CrossoverCase(ApiCase):
+    def create_crossover(self, plan_data=None):
+        return self.call("POST", "/trials",
+                         {"trial_id": "frost", "plan": plan_data or crossover_plan()})
+
+    def register_site(self, site_id="north", timezone="Europe/Berlin"):
+        return self.call("POST", CROSS_ROOT + "/sites", {
+            "site_id": site_id, "market_id": "alpine",
+            "climate": "cold", "timezone": timezone,
+        })
+
+    def enroll_crossover(self, units):
+        return self.call("POST", CROSS_ROOT + "/crossover/enrollment", {"units": units})
+
+    def open_crossover(self, version):
+        return self.call("POST", CROSS_ROOT + "/crossover/open",
+                         {"expected_version": version})
+
+    def setup_crossover(self, *, units=None, plan_data=None):
+        self.create_crossover(plan_data)
+        self.register_site()
+        if units is None:
+            units = [
+                crossover_unit("ab-one", "ab"), crossover_unit("ab-two", "ab"),
+                crossover_unit("ba-one", "ba"), crossover_unit("ba-two", "ba"),
+            ]
+        result = self.enroll_crossover(units)
+        return self.open_crossover(result["version"])
+
+    def cross_deliver(self, delivery_id, rows, *, status=200):
+        return self.call("POST", CROSS_ROOT + "/deliveries",
+                         {"delivery_id": delivery_id, "events": rows}, status=status)
+
+    def cross_preview(self, **params):
+        return self.call("GET", CROSS_ROOT + "/crossover/preview", params=params)
+
+    def cross_market(self, preview=None):
+        preview = preview or self.cross_preview()
+        return preview["market_results"][0]
+
+    def cross_freeze(self, cut):
+        return self.call("POST", CROSS_ROOT + "/evidence", {"expected_cut": cut})
+
+    def cross_review(self, evidence_id, desk, reviewer, *, assessment="endorse", status=200):
+        return self.call(
+            "POST",
+            CROSS_ROOT + f"/evidence/{evidence_id}/markets/alpine/reviews",
+            {"desk": desk, "assessment": assessment, "reviewer": reviewer, "note": "review"},
+            status=status,
+        )
+
+    def cross_issue(self, evidence_id, outcome, *, edition=0, status=200):
+        return self.call("POST", CROSS_MAIN + "/bulletins", {
+            "evidence_id": evidence_id, "expected_edition": edition,
+            "outcome": outcome, "note": "decision",
+        }, status=status)
+
+    def balanced_events(self, *, assisted_wh=90, standard_wh=100):
+        """两种顺序下，辅助期均无手动动作且更省电，顺序间改善一致。"""
+        rows = []
+        for unit in ("ab-one", "ab-two"):
+            rows += cross_observations(unit, "p1", "2026-10-25T09:00:00+00:00",
+                                       manual=True, wh=standard_wh)
+            rows += cross_observations(unit, "p2", "2026-11-01T09:00:00+00:00",
+                                       manual=False, wh=assisted_wh)
+        for unit in ("ba-one", "ba-two"):
+            rows += cross_observations(unit, "p1", "2026-10-25T09:00:00+00:00",
+                                       manual=False, wh=assisted_wh)
+            rows += cross_observations(unit, "p2", "2026-11-01T09:00:00+00:00",
+                                       manual=True, wh=standard_wh)
+        return rows

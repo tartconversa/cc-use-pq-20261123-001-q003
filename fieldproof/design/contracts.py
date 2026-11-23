@@ -20,6 +20,7 @@ ShortText = Annotated[
     str, StringConstraints(strip_whitespace=True, min_length=1, max_length=160)
 ]
 Arm = Literal["standard", "assisted"]
+Sequence = Literal["ab", "ba"]
 Climate = Literal["cold", "temperate", "warm"]
 Load = Literal["light", "heavy"]
 Rate = Annotated[StrictInt, Field(ge=0, le=10_000)]
@@ -75,12 +76,30 @@ class Policy(Input):
     max_cycle_wh: Annotated[StrictInt, Field(ge=1, le=50_000)]
 
 
+class CrossoverPolicy(Input):
+    """两期交叉试验在通用政策之外的预登记门槛。"""
+
+    required_units_per_sequence: Annotated[StrictInt, Field(ge=1, le=100)]
+    required_cycles_per_period: Annotated[StrictInt, Field(ge=1, le=100)]
+    minimum_washout_days: Annotated[StrictInt, Field(ge=0, le=180)]
+    # 两种顺序各自的改善（辅助减标准，比例为基点）分歧不得超过该幅度。
+    max_sequence_divergence_bp: Rate
+    # 能耗差异以每周期瓦时为单位，避免零基期下基点不可解释。
+    max_energy_divergence_wh: Annotated[StrictInt, Field(ge=0, le=1_000_000)]
+    max_missing_energy_bp: Rate
+
+
+class CrossoverPlan(Input):
+    policy: CrossoverPolicy
+
+
 class TrialPlan(Input):
     title: ShortText
     program: Key
     starts_on: date
     ends_before: date
     policy: Policy
+    crossover: CrossoverPlan | None = None
     markets: list[Market] = Field(min_length=1, max_length=20)
 
     @model_validator(mode="after")
@@ -91,6 +110,10 @@ class TrialPlan(Input):
         if len({market.market_id for market in self.markets}) != len(self.markets):
             raise ValueError("Market identifiers must be unique")
         return self
+
+    @property
+    def is_crossover(self) -> bool:
+        return self.crossover is not None
 
     def market(self, market_id: str) -> Market | None:
         return next((item for item in self.markets if item.market_id == market_id), None)
@@ -149,6 +172,75 @@ class Enrollments(Input):
         if len({unit.unit_id for unit in self.units}) != len(self.units):
             raise ValueError("Duplicate units within a single enrollment request")
         return self
+
+
+class CrossoverEnrollment(Input):
+    unit_id: Key
+    site_id: Key
+    sequence: Sequence
+    load: Load
+    first_from: date
+    first_until: date
+    second_from: date
+    second_until: date
+
+    @model_validator(mode="after")
+    def ordered_periods(self):
+        if self.first_from >= self.first_until:
+            raise ValueError("First period end must follow its start")
+        if self.second_from >= self.second_until:
+            raise ValueError("Second period end must follow its start")
+        if self.first_until > self.second_from:
+            raise ValueError("The washout between the two periods cannot be negative")
+        return self
+
+    def schedule_payload(self) -> dict:
+        return {
+            "first_from": self.first_from.isoformat(),
+            "first_until": self.first_until.isoformat(),
+            "second_from": self.second_from.isoformat(),
+            "second_until": self.second_until.isoformat(),
+        }
+
+    def washout_days(self) -> int:
+        return (self.second_from - self.first_until).days
+
+
+class CrossoverEnrollments(Input):
+    units: list[CrossoverEnrollment] = Field(min_length=1, max_length=500)
+
+    @model_validator(mode="after")
+    def unique_units(self):
+        if len({unit.unit_id for unit in self.units}) != len(self.units):
+            raise ValueError("Duplicate units within a single enrollment request")
+        return self
+
+
+class ScheduleCorrection(Input):
+    expected_revision: Annotated[StrictInt, Field(ge=1)]
+    first_from: date
+    first_until: date
+    second_from: date
+    second_until: date
+    reason: ShortText
+
+    @model_validator(mode="after")
+    def ordered_periods(self):
+        if self.first_from >= self.first_until:
+            raise ValueError("First period end must follow its start")
+        if self.second_from >= self.second_until:
+            raise ValueError("Second period end must follow its start")
+        if self.first_until > self.second_from:
+            raise ValueError("The washout between the two periods cannot be negative")
+        return self
+
+    def schedule_payload(self) -> dict:
+        return {
+            "first_from": self.first_from.isoformat(),
+            "first_until": self.first_until.isoformat(),
+            "second_from": self.second_from.isoformat(),
+            "second_until": self.second_until.isoformat(),
+        }
 
 
 def local_day(moment: datetime, site: Site) -> date:

@@ -14,6 +14,7 @@ class Trial:
     version: int
     phase: str
     close_cut: int | None
+    close_schedule_seq: int | None = None
 
     def payload(self) -> dict:
         return {
@@ -22,6 +23,7 @@ class Trial:
             "version": self.version,
             "phase": self.phase,
             "close_cut": self.close_cut,
+            "close_schedule_seq": self.close_schedule_seq,
         }
 
 
@@ -55,13 +57,14 @@ def get_trial(db: Connection, trial_id: str) -> Trial:
         version=row["version"],
         phase=row["phase"],
         close_cut=row["close_cut"],
+        close_schedule_seq=row["close_schedule_seq"],
     )
 
 
 def list_trials(db: Connection, limit: int, after: str) -> list[dict]:
     rows = db.execute(
-        """SELECT trial_id, design, version, phase, close_cut FROM trial
-           WHERE trial_id>? ORDER BY trial_id LIMIT ?""",
+        """SELECT trial_id, design, version, phase, close_cut, close_schedule_seq
+           FROM trial WHERE trial_id>? ORDER BY trial_id LIMIT ?""",
         (after, limit),
     )
     return [
@@ -71,6 +74,7 @@ def list_trials(db: Connection, limit: int, after: str) -> list[dict]:
             "phase": row["phase"],
             "version": row["version"],
             "close_cut": row["close_cut"],
+            "close_schedule_seq": row["close_schedule_seq"],
         }
         for row in rows
     ]
@@ -86,7 +90,8 @@ def create_trial(db: Connection, trial_id: str, plan: TrialPlan) -> Trial:
             return get_trial(db, trial_id)
         raise conflict("trial_exists", "This trial code already has a different plan")
     db.execute(
-        "INSERT INTO trial VALUES (?,?,1,'draft',NULL)", (trial_id, canonical)
+        "INSERT INTO trial(trial_id, design, version, phase, close_cut) VALUES (?,?,1,'draft',NULL)",
+        (trial_id, canonical),
     )
     return get_trial(db, trial_id)
 
@@ -182,6 +187,8 @@ def register_site(db: Connection, trial: Trial, site: Site) -> Site:
 
 
 def enroll(db: Connection, trial: Trial, units: list[Enrollment]) -> dict:
+    if trial.plan.is_crossover:
+        raise conflict("not_parallel", "This trial uses two-period crossover allocation")
     require_phase(trial, "draft")
     current = roster(db, trial.trial_id)
     new = []
@@ -219,6 +226,8 @@ def enroll(db: Connection, trial: Trial, units: list[Enrollment]) -> dict:
 def open_trial(db: Connection, trial: Trial, expected: int) -> Trial:
     check_version(trial, expected)
     require_phase(trial, "draft")
+    if trial.plan.is_crossover:
+        raise conflict("not_parallel", "Open a crossover trial through its own endpoint")
     counts = roster(db, trial.trial_id).split_counts()
     gaps = []
     minimum = trial.plan.policy.required_units_per_arm
@@ -246,12 +255,18 @@ def open_trial(db: Connection, trial: Trial, expected: int) -> Trial:
     return get_trial(db, trial.trial_id)
 
 
-def close_trial(db: Connection, trial: Trial, expected: int, cut: int) -> Trial:
+def close_trial(
+    db: Connection,
+    trial: Trial,
+    expected: int,
+    cut: int,
+    schedule_seq: int | None = None,
+) -> Trial:
     check_version(trial, expected)
     require_phase(trial, "open")
     db.execute(
-        """UPDATE trial SET phase='closed', close_cut=?, version=version+1
-           WHERE trial_id=?""",
-        (cut, trial.trial_id),
+        """UPDATE trial SET phase='closed', close_cut=?, close_schedule_seq=?,
+           version=version+1 WHERE trial_id=?""",
+        (cut, schedule_seq, trial.trial_id),
     )
     return get_trial(db, trial.trial_id)

@@ -19,10 +19,11 @@ def list_reviews(db: Connection, trial_id: str, evidence_id: str, market: str) -
 
 
 def record_review(
-    db: Connection, trial: Trial, evidence_id: str, market: str, submitted: Review
+    db: Connection, trial: Trial, evidence_id: str, market: str, submitted: Review,
+    document: dict | None = None,
 ) -> dict:
     require_phase(trial, "closed")
-    current = evidence.get(db, trial.trial_id, evidence_id)
+    current = document if document is not None else evidence.get(db, trial.trial_id, evidence_id)
     evidence.get_market(current, market)
     existing = list_reviews(db, trial.trial_id, evidence_id, market)
     document = submitted.model_dump()
@@ -77,6 +78,7 @@ def issue(
     trial: Trial,
     market: str,
     request: IssueBulletin,
+    frozen: dict | None = None,
 ) -> dict:
     require_phase(trial, "closed")
     request_digest = fingerprint(request.model_dump())
@@ -92,7 +94,9 @@ def issue(
             "Read the current market bulletin first",
             details={"current_edition": edition},
         )
-    frozen = evidence.get(db, trial.trial_id, request.evidence_id)
+    frozen = frozen if frozen is not None else evidence.get(
+        db, trial.trial_id, request.evidence_id
+    )
     result = evidence.get_market(frozen, market)
     if frozen["cut"] != trial.close_cut:
         raise conflict("stale_evidence", "Only the closed trial cut can be issued")

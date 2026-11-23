@@ -42,3 +42,29 @@ python -m fieldproof.cli --db fieldproof.sqlite3 ingest-sheet valley north-20261
 关闭时提供操作者看到的版本和事实截点，新数据抢先到达会让关闭请求失效。试点关闭后封存全期证据，证据记录包含截点、统计政策、市场结论和内容摘要。可通过证据接口回读或下载指标 CSV。
 
 当成效和风险护栏通过，且现场与方法岗位由不同人员确认同一份证据，市场才允许推进。未解决的事实问题或覆盖缺口可以阻止放行，任一岗位可以记录反对意见。公告记录当时的判断和已有评审，完全相同的发布重试返回原公告。发布请求使用预期版次以保护操作者已经读到的市场状态。
+
+## 两期交叉试验
+
+寒冷站点只有少量愿意参与的家庭时，可以在试点计划中加入 `crossover` 政策，让同一台设备先后经历标准与辅助两个分配期。计划仍然复用市场、对照单元和站点；设备改用独立的交叉名册，按预登记的 `ab`（先标准后辅助）或 `ba`（先辅助后标准）顺序登记，并为每台设备登记两期的前闭后开本地日期与中间洗脱期。平行分组试点不携带 `crossover` 政策，继续按上面的指标和端点运行，两类试验的端点互相拒绝对方的计划。
+
+### 登记、本地日程与开启核对
+
+`POST /trials/{trial_id}/crossover/enrollment` 登记设备及两期日程，洗脱不得短于 `minimum_washout_days`，两期都必须落在试验日期内。`GET /trials/{trial_id}/crossover/schedule` 列出每台设备两期的本地起止日期、洗脱天数和是否达标；单台设备的完整修订史在 `GET /trials/{trial_id}/crossover/units/{unit_id}/schedule`。开启前用 `GET /trials/{trial_id}/crossover/open-checks` 核对每台设备的两期加洗脱日程，以及每个对照单元下两种顺序是否都达到 `required_units_per_sequence`；任一缺口都会在 `POST /trials/{trial_id}/crossover/open` 时以 `crossover_allocation_shortfall` 拒绝。
+
+开启后日程仍可更正：`PUT /trials/{trial_id}/crossover/units/{unit_id}/schedule` 携带 `expected_revision` 追加一个日程修订（含原因与当时的事实截点），陈旧修订号或违反洗脱下限的更正会被拒绝。日程账本位置 `schedule_seq` 随修订增长，关闭试点时会把当时的位置固定到 `close_schedule_seq`。
+
+### 周期归属与现场核查
+
+一个周期只有在开启与闭合的本地日期都落在同一分配期内时才计入该期；只凭开始日期不够。超出两期、落在洗脱期或跨过换挡边界的周期不会进入任何有效配对，原因记录为 `before_first_period`、`after_second_period`、`washout_period` 或 `crosses_period_boundary`。过渡期内明确收到的告警周期虽然被排除在配对之外，仍以 `transition_alarm` 进入现场核查队列并触发 `transition_alarms_visible` 护栏，保证现场看得到。归属按站点 IANA 时区解释本地日期，跨午夜周期归入开启日。
+
+### 成效预览、顺序分歧与放行
+
+`GET /trials/{trial_id}/crossover/preview` 可指定事实截点 `cut` 与日程账本位置 `schedule_seq` 重放历史判断。市场判断只使用两期都完成且达标的同设备配对：每台设备先计算辅助期减标准期的设备内效果，再在顺序内等权平均，最后按预登记单元权重汇总。每个对照单元同时报告 `ab`、`ba` 两种顺序分开的样本量、分期指标和顺序内效果。只完成一期的设备保留在所属顺序的 `period1_only`/`period2_only` 流失与配对覆盖统计中；整条顺序缺失或配对数不足时不能用另一顺序顶替，市场结果转为 `insufficient`。
+
+若两种顺序的改善分歧超过预登记的 `max_sequence_divergence_bp`（比例指标，基点）或 `max_energy_divergence_wh`（能耗，瓦时），即使合并结果有利，`sequence_divergence_*` 护栏也会失败，市场只能暂缓（`hold`）。预览同时给出每个单元的缺口和顺序级效果，操作者可以查明是哪一轮（第一期/第二期）、哪个条件（标准/辅助）使市场从可判定转为未决。
+
+### 更正影响、封存与双岗位复核
+
+`GET /trials/{trial_id}/crossover/impact` 对比两个事实截点和两个日程账本位置，列出从“被某期接受”转为可疑跨期数据的周期，并说明影响的是哪一期、哪一项设备配对（含顺序、单元和受影响的程序条件），同时报告设备配对状态的变化与各市场建议的前后差异。执行证据（事件修订）若没有把周期推出分配期，只会标注来源修订变化而不会误报为跨期。
+
+关闭后 `POST /trials/{trial_id}/evidence` 封存的证据固定关闭截点与 `close_schedule_seq`，其名册与事实摘要只对应当时的配对人群。现场与方法岗位仍由不同人员对同一份证据背书（复用评审与公告端点），公告内的市场结果、CSV（`GET .../metrics.csv`，含顺序、分期与设备内效果行）和评审都与冻结人群一致。
